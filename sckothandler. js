@@ -1,0 +1,98 @@
+const Message = require('../models/Message');
+const User = require('../models/User');
+
+// In-memory index of who is connected to which room right now.
+// Keyed by socket.id so a disconnect can look itself up in O(1).
+// This lives alongside (not instead of) the persisted User.isOnline flag:
+// the in-memory map is the fast path for "who's in this room right now",
+// the DB flag is the durable record that survives a server restart.
+const onlineUsers = new Map(); // socket.id -> { username, room }
+
+function getRoomUsers(room) {
+  return Array.from(onlineUsers.values())
+    .filter((u) => u.room === room)
+    .map((u) => u.username);
+}
+
+function initSocket(io) {
+  io.on('connection', (socket) => {
+    console.log(`Socket connected: ${socket.id}`);
+
+    // --- Lifecycle: join ---
+    socket.on('join_room', async ({ username, room }) => {
+      try {
+        if (!username || !room) {
+          return socket.emit('error_message', { message: 'username and room are required' });
+        }
+
+        socket.join(room);
+        onlineUsers.set(socket.id, { username, room });
+
+        await User.findOneAndUpdate(
+          { username },
+          { isOnline: true, socketId: socket.id, lastSeen: new Date() },
+          { upsert: true, new: true }
+        );
+
+        // Tell the rest of the room someone joined, and refresh everyone's presence list
+        socket.to(room).emit('user_joined', { username, timestamp: new Date() });
+        io.to(room).emit('presence_update', getRoomUsers(room));
+
+        // Catch the new arrival up on recent history
+        const history = await Message.find({ room }).sort({ timestamp: -1 }).limit(50).lean();
+        socket.emit('message_history', history.reverse());
+      } catch (error) {
+        console.error('join_room error:', error.message);
+        socket.emit('error_message', { message: 'Failed to join room' });
+      }
+    });
+
+    // --- Lifecycle: message ---
+    socket.on('send_message', async ({ room, sender, content }) => {
+      try {
+        if (!room || !sender || !content || !content.trim()) return;
+
+        const message = await Message.create({ room, sender, content: content.trim() });
+
+        // Broadcast the persisted document (with its real _id/timestamp) to everyone in the room
+        io.to(room).emit('receive_message', message);
+      } catch (error) {
+        console.error('send_message error:', error.message);
+        socket.emit('error_message', { message: 'Failed to send message' });
+      }
+    });
+
+    // --- Lifecycle: typing indicator ---
+    socket.on('typing', ({ room, username }) => {
+      if (room && username) socket.to(room).emit('user_typing', { username });
+    });
+
+    socket.on('stop_typing', ({ room, username }) => {
+      if (room && username) socket.to(room).emit('user_stop_typing', { username });
+    });
+
+    // --- Lifecycle: disconnect ---
+    socket.on('disconnect', async () => {
+      const entry = onlineUsers.get(socket.id);
+      if (entry) {
+        const { username, room } = entry;
+        onlineUsers.delete(socket.id);
+
+        try {
+          await User.findOneAndUpdate(
+            { username },
+            { isOnline: false, socketId: null, lastSeen: new Date() }
+          );
+        } catch (error) {
+          console.error('disconnect update error:', error.message);
+        }
+
+        socket.to(room).emit('user_left', { username, timestamp: new Date() });
+        io.to(room).emit('presence_update', getRoomUsers(room));
+      }
+      console.log(`Socket disconnected: ${socket.id}`);
+    });
+  });
+}
+
+module.exports = initSocket;
